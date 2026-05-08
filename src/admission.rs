@@ -86,7 +86,7 @@ fn default_aresta_image() -> String {
     // `ARESTA_IMAGE` env var on the enxerto Deployment so we don't
     // have to rebuild enxerto every time aresta ships. Pinned SHA
     // here so unmodified tests + dev environments still work.
-    "ghcr.io/pleme-io/aresta:amd64-c9f737d".into()
+    "ghcr.io/pleme-io/aresta:amd64-954ab78".into()
 }
 fn default_iptables_image() -> String {
     // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
