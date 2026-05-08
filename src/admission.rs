@@ -63,9 +63,11 @@ fn default_aresta_image() -> String {
     "ghcr.io/pleme-io/aresta:amd64-latest".into()
 }
 fn default_iptables_image() -> String {
-    // Small busybox-based init image; iptables-restore lives at
-    // /sbin/iptables-restore in BusyBox.
-    "alpine/socat:1.7.4.4".into()
+    // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
+    // image, widely vendored in service-mesh init containers. Future
+    // alternatives: linkerd/proxy-init or a minimal pleme-io-built
+    // iptables-only image.
+    "nicolaka/netshoot:latest".into()
 }
 fn default_csi_driver() -> String {
     "csi.spiffe.io".into()
