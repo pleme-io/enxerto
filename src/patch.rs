@@ -153,6 +153,16 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
     //        the openclaw fleet; revisit when an actual case arrives.
     //      - startupProbe — usually wants the workload's actual
     //        startup signal; aresta's /ready isn't a substitute.
+    // Build a set of ports the operator wants left alone (e.g. for
+    // cloudflared whose metrics + probe both bind to :2000 directly,
+    // and the workload's own probe should hit it not the proxy).
+    let skip_ports_set: std::collections::HashSet<u16> = skip_ports
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u16>().ok())
+        .collect();
+
     if let Some(containers) = pod.pointer("/spec/containers").and_then(|v| v.as_array()) {
         for (idx, container) in containers.iter().enumerate() {
             for (probe, target_path) in
@@ -162,6 +172,19 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
                     // Only rewrite httpGet probes (skip tcpSocket /
                     // grpc / exec).
                     if httpget.is_object() {
+                        // If the probe targets a skip-inbound port,
+                        // it's already plaintext-reachable from
+                        // kubelet — leave it alone so kubelet checks
+                        // the workload's actual readiness, not the
+                        // proxy's.
+                        let probe_port_skipped = httpget
+                            .get("port")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|n| u16::try_from(n).ok())
+                            .map_or(false, |p| skip_ports_set.contains(&p));
+                        if probe_port_skipped {
+                            continue;
+                        }
                         // Use the literal port number 4191 (NOT the
                         // "mesh-probe" name) — K8s probe named-port
                         // resolution is scoped to the container's own
@@ -590,6 +613,38 @@ mod tests {
         assert_eq!(ready, "mesh-probe");
         let ready_path = sidecar.pointer("/readinessProbe/httpGet/path").unwrap();
         assert_eq!(ready_path, "/ready");
+    }
+
+    #[test]
+    fn probe_rewrite_skips_when_port_in_skip_inbound_list() {
+        // Cloudflared-style — its metrics+probe both bind 2000, and
+        // we skip 2000 in PREROUTING REDIRECT. The rewrite should
+        // leave the probe alone so kubelet hits the workload's own
+        // /ready, not the proxy's.
+        let pod = json!({
+            "metadata": {
+                "name": "x",
+                "annotations": {
+                    "enxerto.mesh.pleme.io/skip-inbound-ports": "2000"
+                }
+            },
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "livenessProbe": { "httpGet": { "path": "/ready", "port": 2000 } },
+                    "readinessProbe": { "httpGet": { "path": "/ready", "port": 2000 } }
+                }]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        assert!(
+            !ops.iter().any(|op| op
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map_or(false, |p| p.contains("livenessProbe/httpGet/port"))),
+            "probes targeting skip-inbound ports must not be rewritten — got ops {:#?}",
+            ops
+        );
     }
 
     #[test]
