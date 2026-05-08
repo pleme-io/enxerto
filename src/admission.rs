@@ -36,6 +36,13 @@ pub struct InjectorConfig {
     /// can pass this in via a per-pod annotation in a follow-up.
     #[serde(default = "default_aresta_config_cm")]
     pub aresta_config_cm: String,
+
+    /// Image pull secrets to ensure on the injected pod (so the
+    /// aresta sidecar can pull from ghcr if the package is private).
+    /// Empty = no injection (assumes the workload's ServiceAccount or
+    /// pod-level config already covers it).
+    #[serde(default = "default_image_pull_secrets")]
+    pub image_pull_secrets: Vec<String>,
 }
 
 impl Default for InjectorConfig {
@@ -47,6 +54,7 @@ impl Default for InjectorConfig {
             inbound_port: default_inbound_port(),
             upstream_port: default_upstream_port(),
             aresta_config_cm: default_aresta_config_cm(),
+            image_pull_secrets: default_image_pull_secrets(),
         }
     }
 }
@@ -70,6 +78,9 @@ fn default_upstream_port() -> u16 {
 }
 fn default_aresta_config_cm() -> String {
     "openclaw-mesh-aresta-config".into()
+}
+fn default_image_pull_secrets() -> Vec<String> {
+    vec!["ghcr-pull-secret".into()]
 }
 
 /// Decide whether to inject. Inputs:

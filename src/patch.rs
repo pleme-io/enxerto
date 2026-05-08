@@ -71,6 +71,31 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
         "value": aresta_sidecar(cfg)
     }));
 
+    // 5. imagePullSecrets — ensure the configured Secrets are present
+    //    so the aresta sidecar can pull from ghcr. Append-or-create.
+    if !cfg.image_pull_secrets.is_empty() {
+        let secrets: Vec<Value> = cfg
+            .image_pull_secrets
+            .iter()
+            .map(|s| json!({ "name": s }))
+            .collect();
+        if pod.pointer("/spec/imagePullSecrets").is_none() {
+            ops.push(json!({
+                "op": "add",
+                "path": "/spec/imagePullSecrets",
+                "value": secrets
+            }));
+        } else {
+            for s in secrets {
+                ops.push(json!({
+                    "op": "add",
+                    "path": "/spec/imagePullSecrets/-",
+                    "value": s
+                }));
+            }
+        }
+    }
+
     ops
 }
 
@@ -161,8 +186,8 @@ mod tests {
             }
         });
         let ops = build_patch(&pod, &InjectorConfig::default());
-        // 1 annotation + 2 volumes (spiffe-csi + aresta-config) + 1 init + 1 container = 5
-        assert_eq!(ops.len(), 5);
+        // 1 annotation + 2 volumes + 1 init + 1 container + 1 imagePullSecrets-array = 6
+        assert_eq!(ops.len(), 6);
         assert!(ops[0].get("path").unwrap().as_str().unwrap()
             .starts_with("/metadata/annotations/mesh.pleme.io"));
         assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes/-");
@@ -176,8 +201,9 @@ mod tests {
         // Minimal pod — no annotations, no volumes, no initContainers.
         let pod = json!({"metadata": {"name": "x"}, "spec": {"containers": [{"name":"main"}]}});
         let ops = build_patch(&pod, &InjectorConfig::default());
-        // 1 annotation + 1 volumes-full-array + 1 init-full-array + 1 container = 4
-        assert_eq!(ops.len(), 4);
+        // 1 annotation + 1 volumes-full-array + 1 init-full-array
+        // + 1 container + 1 imagePullSecrets-array = 5
+        assert_eq!(ops.len(), 5);
 
         // Annotation: full-map add.
         assert_eq!(ops[0].get("path").unwrap(), "/metadata/annotations");
