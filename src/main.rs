@@ -61,6 +61,15 @@ async fn main() -> Result<()> {
     // off-cluster destinations (cloudflared → CF edge, workloads →
     // public APIs). Operator passes this through the helm chart's
     // `meshOutboundCidrs` value.
+    // Operator-provided aresta image override — avoids rebuilding
+    // enxerto on every aresta version bump. CI workflow sets this
+    // env from the most-recently-published aresta tag.
+    if let Ok(image) = std::env::var("ARESTA_IMAGE") {
+        if !image.is_empty() {
+            injector_cfg.aresta_image = image.clone();
+            info!(image, "aresta image overridden from ARESTA_IMAGE env");
+        }
+    }
     if let Ok(raw) = std::env::var("MESH_OUTBOUND_CIDRS") {
         injector_cfg.mesh_outbound_cidrs = raw
             .split(',')

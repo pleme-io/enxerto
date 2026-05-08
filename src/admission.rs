@@ -82,10 +82,11 @@ impl Default for InjectorConfig {
 }
 
 fn default_aresta_image() -> String {
-    // Pinned SHA — kubelet's IfNotPresent caches by tag, so
-    // amd64-latest stays stale across rebuilds. Bump this when
-    // shipping a new aresta build.
-    "ghcr.io/pleme-io/aresta:amd64-0d8ae51".into()
+    // Compile-time fallback. Operator overrides via the
+    // `ARESTA_IMAGE` env var on the enxerto Deployment so we don't
+    // have to rebuild enxerto every time aresta ships. Pinned SHA
+    // here so unmodified tests + dev environments still work.
+    "ghcr.io/pleme-io/aresta:amd64-c9f737d".into()
 }
 fn default_iptables_image() -> String {
     // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
