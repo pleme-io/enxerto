@@ -162,10 +162,17 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
                     // Only rewrite httpGet probes (skip tcpSocket /
                     // grpc / exec).
                     if httpget.is_object() {
+                        // Use the literal port number 4191 (NOT the
+                        // "mesh-probe" name) — K8s probe named-port
+                        // resolution is scoped to the container's own
+                        // portList, and the workload container has no
+                        // mesh-probe port. The aresta sidecar binds
+                        // 4191 in the pod network namespace, so it's
+                        // reachable via the pod IP.
                         ops.push(json!({
                             "op": "replace",
                             "path": format!("/spec/containers/{idx}/{probe}/httpGet/port"),
-                            "value": "mesh-probe"
+                            "value": 4191
                         }));
                         ops.push(json!({
                             "op": "replace",
@@ -465,7 +472,7 @@ mod tests {
         assert!(
             replaces.iter().any(|op| op.get("path").unwrap()
                 == "/spec/containers/0/livenessProbe/httpGet/port"
-                && op.get("value").unwrap() == "mesh-probe")
+                && op.get("value").unwrap() == 4191)
         );
         assert!(
             replaces.iter().any(|op| op.get("path").unwrap()
@@ -476,7 +483,7 @@ mod tests {
         assert!(
             replaces.iter().any(|op| op.get("path").unwrap()
                 == "/spec/containers/0/readinessProbe/httpGet/port"
-                && op.get("value").unwrap() == "mesh-probe")
+                && op.get("value").unwrap() == 4191)
         );
         assert!(
             replaces.iter().any(|op| op.get("path").unwrap()
