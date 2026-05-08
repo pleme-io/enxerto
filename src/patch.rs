@@ -36,16 +36,10 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
         }));
     }
 
-    // 2. Volumes — spiffe-csi + aresta-config (ConfigMap mount).
-    //    Append to /spec/volumes (creating the array if absent).
-    //
-    //    Per-pod override: if the pod carries the
-    //    `enxerto.mesh.pleme.io/aresta-config-cm` annotation, the
-    //    injector mounts THAT ConfigMap instead of the operator-
-    //    configured default. Lets multi-Servico clusters give each
-    //    Servico its own aresta config (different peer allow-lists,
-    //    different policy defaults, etc.) without bouncing the
-    //    injector.
+    // 2. Volumes — spiffe-csi + aresta-config. IDEMPOTENT: skip a
+    //    volume if a same-name volume already exists on the pod
+    //    (chart-emitted templates may have wired spiffe-csi for
+    //    pre-mesh experiments; duplicate names invalidate the Pod).
     let aresta_cfg_cm_name = pod
         .pointer(&format!(
             "/metadata/annotations/{}",
@@ -54,23 +48,40 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
         .and_then(|v| v.as_str())
         .map_or_else(|| cfg.aresta_config_cm.clone(), str::to_string);
 
-    let spiffe_vol = json!({
-        "name": "spiffe-csi",
-        "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
-    });
-    let aresta_cfg_vol = json!({
-        "name": "aresta-config",
-        "configMap": { "name": aresta_cfg_cm_name }
-    });
-    if pod.pointer("/spec/volumes").is_none() {
+    let existing_volumes: std::collections::HashSet<String> = pod
+        .pointer("/spec/volumes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut new_volumes: Vec<Value> = Vec::new();
+    if !existing_volumes.contains("spiffe-csi") {
+        new_volumes.push(json!({
+            "name": "spiffe-csi",
+            "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
+        }));
+    }
+    if !existing_volumes.contains("aresta-config") {
+        new_volumes.push(json!({
+            "name": "aresta-config",
+            "configMap": { "name": aresta_cfg_cm_name }
+        }));
+    }
+
+    if pod.pointer("/spec/volumes").is_none() && !new_volumes.is_empty() {
         ops.push(json!({
             "op": "add",
             "path": "/spec/volumes",
-            "value": [spiffe_vol, aresta_cfg_vol]
+            "value": new_volumes
         }));
     } else {
-        ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": spiffe_vol }));
-        ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": aresta_cfg_vol }));
+        for v in new_volumes {
+            ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": v }));
+        }
     }
 
     // 3. iptables-redirect init-container → /spec/initContainers.
