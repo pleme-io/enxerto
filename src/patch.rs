@@ -269,14 +269,28 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
         },
         "command": ["/bin/sh", "-c"],
         "args": [format!(
-            // INBOUND: redirect inbound TCP to aresta-in (15001)
-            // unless: ssh/dns/metrics/aresta-self ports, or loopback.
+            // INBOUND: REDIRECT all incoming TCP to aresta-in (15001)
+            // unless the dst port is in the skip list:
+            //   22   ssh (ops access)
+            //   53   DNS
+            //   9090 mesh-metrics (Prometheus scrape)
+            //   4191 mesh-probe (kubelet plain-HTTP /live, /ready)
+            //   15001 aresta-in itself (avoid the REDIRECT looping)
+            //   15006 aresta-out itself
+            //   plus per-pod skip-inbound-ports annotations
+            //   plus 127.0.0.0/8 (loopback)
             //
-            // OUTBOUND: redirect outbound TCP to aresta-out (15006)
-            // unless: traffic from aresta's own UID (1737) — aresta's
-            // own dial-out to peers must NOT loop, traffic to
-            // loopback / kube-apiserver / DNS, or already destined
-            // for aresta-out (15006) / aresta-in (15001).
+            // OUTBOUND: REDIRECT outgoing TCP to aresta-out (15006)
+            // unless:
+            //   - source UID == aresta (avoid looping the proxy's
+            //     own egress through itself)
+            //   - dst is loopback / DNS / 443 (apiserver, public APIs,
+            //     CF edge) / 6443 (k3s API)
+            //   - dst port is aresta-self (15001/15006)
+            //   - per-pod skip-inbound-ports applies symmetrically
+            //   - dst doesn't match any mesh_outbound_cidrs (when
+            //     non-empty — restricts the catch-all REDIRECT to
+            //     in-cluster east-west only)
             "iptables -t nat -N ARESTA_INBOUND 2>/dev/null || true; \
              iptables -t nat -F ARESTA_INBOUND; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 22 -j RETURN; \
