@@ -14,6 +14,12 @@ pub const INJECTED_ANNOTATION: &str = "mesh.pleme.io/injected";
 /// `/etc/aresta` instead of the operator-configured default.
 pub const ARESTA_CONFIG_CM_ANNOTATION: &str = "enxerto.mesh.pleme.io/aresta-config-cm";
 
+/// Optional per-pod annotation: comma-separated TCP ports to skip in
+/// iptables PREROUTING + OUTPUT. Used to keep kubelet's plaintext
+/// probes (HTTP on the workload's own port) from being redirected to
+/// aresta-in's mTLS-only listener. e.g. "8082,8083" for cartorio+lacre.
+pub const SKIP_INBOUND_PORTS_ANNOTATION: &str = "enxerto.mesh.pleme.io/skip-inbound-ports";
+
 /// Operator-tunable knobs (hard-coded to defaults for M2.2; M4
 /// renderer makes these per-mesh).
 #[derive(Debug, Clone, Deserialize, Serialize)]

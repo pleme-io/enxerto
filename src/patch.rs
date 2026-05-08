@@ -3,7 +3,9 @@
 
 use serde_json::{Value, json};
 
-use crate::admission::{ARESTA_CONFIG_CM_ANNOTATION, INJECTED_ANNOTATION, InjectorConfig};
+use crate::admission::{
+    ARESTA_CONFIG_CM_ANNOTATION, INJECTED_ANNOTATION, InjectorConfig, SKIP_INBOUND_PORTS_ANNOTATION,
+};
 
 /// Generate the JSON-Patch ops that graft mesh containers + volumes
 /// + the idempotency annotation onto a Pod spec. `pod` is the
@@ -72,7 +74,14 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
     }
 
     // 3. iptables-redirect init-container → /spec/initContainers.
-    let init = iptables_init_container(cfg);
+    let skip_ports = pod
+        .pointer(&format!(
+            "/metadata/annotations/{}",
+            escape_key(SKIP_INBOUND_PORTS_ANNOTATION)
+        ))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let init = iptables_init_container(cfg, skip_ports.as_deref());
     if pod.pointer("/spec/initContainers").is_none() {
         ops.push(json!({ "op": "add", "path": "/spec/initContainers", "value": [init] }));
     } else {
@@ -115,7 +124,20 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
     ops
 }
 
-fn iptables_init_container(cfg: &InjectorConfig) -> Value {
+fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str>) -> Value {
+    // Build extra RETURN rules for ports the workload speaks
+    // plaintext on (kubelet probes hit the workload directly).
+    let extra_skip_lines: String = skip_inbound_ports
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u16>().ok())
+        .map(|p| {
+            format!(
+                "iptables -t nat -A ARESTA_INBOUND -p tcp --dport {p} -j RETURN; \
+                 iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {p} -j RETURN; "
+            )
+        })
+        .collect();
     json!({
         "name": "enxerto-iptables-init",
         "image": cfg.iptables_image,
@@ -144,9 +166,6 @@ fn iptables_init_container(cfg: &InjectorConfig) -> Value {
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport {inbound} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport {outbound} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -d 127.0.0.0/8 -j RETURN; \
-             iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {inbound}; \
-             iptables -t nat -C PREROUTING -p tcp -j ARESTA_INBOUND 2>/dev/null || \
-               iptables -t nat -A PREROUTING -p tcp -j ARESTA_INBOUND; \
              iptables -t nat -N ARESTA_OUTBOUND 2>/dev/null || true; \
              iptables -t nat -F ARESTA_OUTBOUND; \
              iptables -t nat -A ARESTA_OUTBOUND -m owner --uid-owner {aresta_uid} -j RETURN; \
@@ -155,6 +174,10 @@ fn iptables_init_container(cfg: &InjectorConfig) -> Value {
              iptables -t nat -A ARESTA_OUTBOUND -p udp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {inbound} -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {outbound} -j RETURN; \
+             {extra_skip}\
+             iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {inbound}; \
+             iptables -t nat -C PREROUTING -p tcp -j ARESTA_INBOUND 2>/dev/null || \
+               iptables -t nat -A PREROUTING -p tcp -j ARESTA_INBOUND; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port {outbound}; \
              iptables -t nat -C OUTPUT -p tcp -j ARESTA_OUTBOUND 2>/dev/null || \
                iptables -t nat -A OUTPUT -p tcp -j ARESTA_OUTBOUND; \
@@ -162,6 +185,7 @@ fn iptables_init_container(cfg: &InjectorConfig) -> Value {
             inbound = cfg.inbound_port,
             outbound = 15006,
             aresta_uid = 1737,
+            extra_skip = extra_skip_lines,
         )]
     })
 }
@@ -203,7 +227,11 @@ fn aresta_sidecar(cfg: &InjectorConfig) -> Value {
             "periodSeconds": 5
         },
         "resources": {
-            "requests": { "cpu": "20m", "memory": "32Mi" },
+            // Tight CPU req — pleme-dev's single-node cluster runs N
+            // Servicos × aresta sidecar; default 20m × 7 sidecars
+            // exhausted node CPU. 5m is enough for proxy idle + the
+            // occasional handshake; bursts are absorbed by the limit.
+            "requests": { "cpu": "5m",  "memory": "32Mi" },
             "limits":   { "cpu": "200m", "memory": "128Mi" }
         }
     })
@@ -270,7 +298,7 @@ mod tests {
     #[test]
     fn iptables_init_has_net_admin() {
         let cfg = InjectorConfig::default();
-        let init = iptables_init_container(&cfg);
+        let init = iptables_init_container(&cfg, None);
         let caps = init
             .pointer("/securityContext/capabilities/add")
             .unwrap()
