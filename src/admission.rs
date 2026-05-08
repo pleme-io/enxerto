@@ -65,7 +65,10 @@ impl Default for InjectorConfig {
 }
 
 fn default_aresta_image() -> String {
-    "ghcr.io/pleme-io/aresta:amd64-latest".into()
+    // Pinned SHA — kubelet's IfNotPresent caches by tag, so
+    // amd64-latest stays stale across rebuilds. Bump this when
+    // shipping a new aresta build.
+    "ghcr.io/pleme-io/aresta:amd64-570a9db".into()
 }
 fn default_iptables_image() -> String {
     // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
