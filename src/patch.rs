@@ -8,35 +8,54 @@ use crate::admission::{INJECTED_ANNOTATION, InjectorConfig};
 /// Generate the JSON-Patch ops that graft mesh containers + volumes
 /// + the idempotency annotation onto a Pod spec. `pod` is the
 /// AdmissionReview-supplied pod object (the `request.object`).
+///
+/// JSON-Patch `add /path/-` only appends to an *existing* array. If
+/// the pod has no `volumes` / `initContainers` / `annotations`, those
+/// paths don't exist yet — `/-` fails with "doc is missing path".
+/// The fix: detect missing fields and emit a full-array (or empty-
+/// object) `add` for them first.
 #[must_use]
-pub fn build_patch(_pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
+pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
     let mut ops: Vec<Value> = Vec::new();
 
-    // 1. Annotation (idempotency marker).
-    ops.push(json!({
-        "op": "add",
-        "path": format!("/metadata/annotations/{}", escape_key(INJECTED_ANNOTATION)),
-        "value": "true",
-    }));
+    // 1. Annotation. /metadata/annotations may not exist on minimal
+    //    pods; if missing, create the whole map at once.
+    if pod.pointer("/metadata/annotations").is_none() {
+        ops.push(json!({
+            "op": "add",
+            "path": "/metadata/annotations",
+            "value": { INJECTED_ANNOTATION: "true" }
+        }));
+    } else {
+        ops.push(json!({
+            "op": "add",
+            "path": format!("/metadata/annotations/{}", escape_key(INJECTED_ANNOTATION)),
+            "value": "true",
+        }));
+    }
 
-    // 2. Add the spiffe-csi volume to spec.volumes (use `-` to append).
-    ops.push(json!({
-        "op": "add",
-        "path": "/spec/volumes/-",
-        "value": {
-            "name": "spiffe-csi",
-            "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
-        }
-    }));
+    // 2. spiffe-csi volume → /spec/volumes (create the array if it
+    //    doesn't exist).
+    let spiffe_vol = json!({
+        "name": "spiffe-csi",
+        "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
+    });
+    if pod.pointer("/spec/volumes").is_none() {
+        ops.push(json!({ "op": "add", "path": "/spec/volumes", "value": [spiffe_vol] }));
+    } else {
+        ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": spiffe_vol }));
+    }
 
-    // 3. Append the iptables-redirect init-container.
-    ops.push(json!({
-        "op": "add",
-        "path": "/spec/initContainers/-",
-        "value": iptables_init_container(cfg)
-    }));
+    // 3. iptables-redirect init-container → /spec/initContainers.
+    let init = iptables_init_container(cfg);
+    if pod.pointer("/spec/initContainers").is_none() {
+        ops.push(json!({ "op": "add", "path": "/spec/initContainers", "value": [init] }));
+    } else {
+        ops.push(json!({ "op": "add", "path": "/spec/initContainers/-", "value": init }));
+    }
 
-    // 4. Append the aresta sidecar container.
+    // 4. aresta sidecar → /spec/containers (always exists; pods are
+    //    validated to have ≥1 container).
     ops.push(json!({
         "op": "add",
         "path": "/spec/containers/-",
@@ -123,20 +142,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn patch_adds_expected_ops() {
-        let pod = json!({"metadata": {"name": "x"}, "spec": {"containers": []}});
+    fn patch_appends_when_arrays_already_exist() {
+        let pod = json!({
+            "metadata": { "name": "x", "annotations": { "x": "y" } },
+            "spec": {
+                "containers": [{"name": "main"}],
+                "initContainers": [{"name": "old-init"}],
+                "volumes": [{"name": "data"}]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        assert_eq!(ops.len(), 4);
+        assert!(ops[0].get("path").unwrap().as_str().unwrap()
+            .starts_with("/metadata/annotations/mesh.pleme.io"));
+        assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes/-");
+        assert_eq!(ops[2].get("path").unwrap(), "/spec/initContainers/-");
+        assert_eq!(ops[3].get("path").unwrap(), "/spec/containers/-");
+    }
+
+    #[test]
+    fn patch_handles_missing_arrays() {
+        // Minimal pod — no annotations, no volumes, no initContainers.
+        let pod = json!({"metadata": {"name": "x"}, "spec": {"containers": [{"name":"main"}]}});
         let ops = build_patch(&pod, &InjectorConfig::default());
         assert_eq!(ops.len(), 4);
 
-        // Annotation key escaped.
-        let path = ops[0].get("path").unwrap().as_str().unwrap();
-        assert!(
-            path.starts_with("/metadata/annotations/mesh.pleme.io"),
-            "got: {path}"
-        );
-        // Subsequent ops target /spec/*.
-        assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes/-");
-        assert_eq!(ops[2].get("path").unwrap(), "/spec/initContainers/-");
+        // Annotation: full-map add.
+        assert_eq!(ops[0].get("path").unwrap(), "/metadata/annotations");
+        assert!(ops[0].pointer("/value/mesh.pleme.io~1injected").is_some());
+
+        // Volumes: full-array add.
+        assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes");
+        assert!(ops[1].get("value").unwrap().is_array());
+
+        // initContainers: full-array add.
+        assert_eq!(ops[2].get("path").unwrap(), "/spec/initContainers");
+        assert!(ops[2].get("value").unwrap().is_array());
+
+        // containers: append (always exists).
         assert_eq!(ops[3].get("path").unwrap(), "/spec/containers/-");
     }
 
