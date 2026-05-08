@@ -112,19 +112,25 @@ fn iptables_init_container(cfg: &InjectorConfig) -> Value {
         },
         "command": ["/bin/sh", "-c"],
         "args": [format!(
-            // Redirect inbound TCP (anything not destined for loopback) to 15001.
-            // Skip the proxy's own UID (1737) so its outbound calls don't loop.
-            // Skip ports 22 (ssh), 53 (DNS) so kubelet probes/dns work.
+            // Redirect inbound TCP to 15001 (aresta inbound) UNLESS:
+            //  - destined for the proxy's own metrics/health ports
+            //  - destined for the iptables-skip ports (22 ssh, 53 dns)
+            //  - destined for loopback (127.0.0.0/8) — pod-internal IPC
+            //
+            // We skip 9090 (aresta prometheus) so kubelet probes hit
+            // plaintext HTTP, not the mTLS-only inbound listener.
             "iptables -t nat -N ARESTA_INBOUND 2>/dev/null || true; \
              iptables -t nat -F ARESTA_INBOUND; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 22 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 53 -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport 9090 -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -d 127.0.0.0/8 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {}; \
              iptables -t nat -C PREROUTING -p tcp -j ARESTA_INBOUND 2>/dev/null || \
                iptables -t nat -A PREROUTING -p tcp -j ARESTA_INBOUND; \
              echo 'enxerto: iptables PREROUTING redirect to {} installed'",
-            cfg.inbound_port, cfg.inbound_port
+            cfg.inbound_port, cfg.inbound_port, cfg.inbound_port
         )]
     })
 }
