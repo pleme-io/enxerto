@@ -132,6 +132,61 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
         }
     }
 
+    // 6. Probe rewrite — kubelet's livenessProbe + readinessProbe on
+    //    each workload container originally hit the workload's port
+    //    directly. With the aresta sidecar in place, those ports get
+    //    REDIRECTed by iptables PREROUTING into aresta-in's mTLS-only
+    //    listener — the kubelet's plaintext probe fails, the pod
+    //    CrashLoopBackOff'd. Rewriting both probes to the aresta
+    //    proxy's plain-HTTP probe port (4191) lets kubelet through
+    //    while leaving the workload port REDIRECTed for real peer
+    //    mTLS traffic.
+    //
+    //    What we rewrite:
+    //      - httpGet probes: replace `port` with the proxy probe
+    //        port, replace `path` with "/ready" (liveness) or "/live"
+    //        (also "/ready" for the readiness probe).
+    //
+    //    What we leave alone:
+    //      - tcpSocket / grpc / exec probes — these don't translate
+    //        to a plain-HTTP /live, /ready endpoint shape. Rare in
+    //        the openclaw fleet; revisit when an actual case arrives.
+    //      - startupProbe — usually wants the workload's actual
+    //        startup signal; aresta's /ready isn't a substitute.
+    if let Some(containers) = pod.pointer("/spec/containers").and_then(|v| v.as_array()) {
+        for (idx, container) in containers.iter().enumerate() {
+            for (probe, target_path) in
+                [("livenessProbe", "/live"), ("readinessProbe", "/ready")]
+            {
+                if let Some(httpget) = container.pointer(&format!("/{probe}/httpGet")) {
+                    // Only rewrite httpGet probes (skip tcpSocket /
+                    // grpc / exec).
+                    if httpget.is_object() {
+                        ops.push(json!({
+                            "op": "replace",
+                            "path": format!("/spec/containers/{idx}/{probe}/httpGet/port"),
+                            "value": "mesh-probe"
+                        }));
+                        ops.push(json!({
+                            "op": "replace",
+                            "path": format!("/spec/containers/{idx}/{probe}/httpGet/path"),
+                            "value": target_path
+                        }));
+                        // Force scheme to HTTP — workload may have
+                        // been HTTPS but aresta's probe is plain.
+                        if httpget.get("scheme").is_some() {
+                            ops.push(json!({
+                                "op": "replace",
+                                "path": format!("/spec/containers/{idx}/{probe}/httpGet/scheme"),
+                                "value": "HTTP"
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ops
 }
 
@@ -197,6 +252,7 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 22 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 9090 -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport 4191 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport {inbound} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport {outbound_port} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -d 127.0.0.0/8 -j RETURN; \
@@ -242,8 +298,28 @@ fn aresta_sidecar(cfg: &InjectorConfig) -> Value {
         "ports": [
             { "name": "mesh-inbound", "containerPort": cfg.inbound_port, "protocol": "TCP" },
             { "name": "mesh-outbound", "containerPort": 15006, "protocol": "TCP" },
-            { "name": "mesh-metrics", "containerPort": 9090, "protocol": "TCP" }
+            { "name": "mesh-metrics", "containerPort": 9090, "protocol": "TCP" },
+            // Plain-HTTP probe-port — kubelet hits /live + /ready
+            // here. Workload's livenessProbe + readinessProbe are
+            // rewritten by the patcher to point at this named port,
+            // so kubelet doesn't go through the iptables PREROUTING
+            // REDIRECT into the mTLS-only inbound listener.
+            { "name": "mesh-probe", "containerPort": 4191, "protocol": "TCP" }
         ],
+        // Aresta itself reports liveness on its probe port — so even
+        // before SVID acquisition (probe /ready returns 503), kubelet
+        // sees the proxy as alive (probe /live = 200) and doesn't
+        // restart it during the SPIRE-registration window.
+        "livenessProbe": {
+            "httpGet": { "path": "/live", "port": "mesh-probe" },
+            "initialDelaySeconds": 2,
+            "periodSeconds": 30
+        },
+        "readinessProbe": {
+            "httpGet": { "path": "/ready", "port": "mesh-probe" },
+            "initialDelaySeconds": 2,
+            "periodSeconds": 5
+        },
         "volumeMounts": [
             {
                 "name": "spiffe-csi",
@@ -256,11 +332,6 @@ fn aresta_sidecar(cfg: &InjectorConfig) -> Value {
                 "readOnly": true
             }
         ],
-        "readinessProbe": {
-            "httpGet": { "path": "/metrics", "port": 9090 },
-            "initialDelaySeconds": 1,
-            "periodSeconds": 5
-        },
         "resources": {
             // Tight CPU req — pleme-dev's single-node cluster runs N
             // Servicos × aresta sidecar; default 20m × 7 sidecars
@@ -359,6 +430,168 @@ mod tests {
         assert!(
             !args.contains("-d 10.42.0.0/16 -j REDIRECT"),
             "must NOT use per-CIDR REDIRECT when mesh_outbound_cidrs is empty"
+        );
+    }
+
+    #[test]
+    fn probe_httpget_rewritten_to_mesh_probe_port() {
+        let pod = json!({
+            "metadata": {"name": "x"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "livenessProbe": {
+                        "httpGet": { "path": "/healthz", "port": 8082 }
+                    },
+                    "readinessProbe": {
+                        "httpGet": { "path": "/healthz", "port": 8082 }
+                    }
+                }]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        // Locate the four replace ops (one path + one port per probe).
+        let replaces: Vec<_> = ops
+            .iter()
+            .filter(|op| op.get("op").and_then(|v| v.as_str()) == Some("replace"))
+            .collect();
+        assert!(
+            replaces.len() >= 4,
+            "expect at least 2 path + 2 port replacements; got {} ops:\n{:#?}",
+            replaces.len(),
+            replaces
+        );
+        // Liveness probe rewritten to /live + mesh-probe.
+        assert!(
+            replaces.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/0/livenessProbe/httpGet/port"
+                && op.get("value").unwrap() == "mesh-probe")
+        );
+        assert!(
+            replaces.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/0/livenessProbe/httpGet/path"
+                && op.get("value").unwrap() == "/live")
+        );
+        // Readiness probe rewritten to /ready + mesh-probe.
+        assert!(
+            replaces.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/0/readinessProbe/httpGet/port"
+                && op.get("value").unwrap() == "mesh-probe")
+        );
+        assert!(
+            replaces.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/0/readinessProbe/httpGet/path"
+                && op.get("value").unwrap() == "/ready")
+        );
+    }
+
+    #[test]
+    fn probe_rewrite_skips_tcp_socket_probes() {
+        let pod = json!({
+            "metadata": {"name": "x"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "livenessProbe": {
+                        "tcpSocket": { "port": 8082 }
+                    }
+                }]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        // No replace ops should target livenessProbe.
+        assert!(
+            !ops.iter().any(|op| op
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map_or(false, |p| p.contains("livenessProbe"))),
+            "tcpSocket probes must not be rewritten — got ops {:#?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn probe_rewrite_skips_grpc_probes() {
+        let pod = json!({
+            "metadata": {"name": "x"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "livenessProbe": {
+                        "grpc": { "port": 9090 }
+                    }
+                }]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        assert!(
+            !ops.iter().any(|op| op
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map_or(false, |p| p.contains("livenessProbe"))),
+            "grpc probes must not be rewritten — got ops {:#?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn probe_rewrite_handles_multi_container_pods() {
+        let pod = json!({
+            "metadata": {"name": "x"},
+            "spec": {
+                "containers": [
+                    {
+                        "name": "first",
+                        "livenessProbe": { "httpGet": { "path": "/h", "port": 8001 } }
+                    },
+                    {
+                        "name": "second",
+                        "readinessProbe": { "httpGet": { "path": "/r", "port": 8002 } }
+                    }
+                ]
+            }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        assert!(
+            ops.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/0/livenessProbe/httpGet/port")
+        );
+        assert!(
+            ops.iter().any(|op| op.get("path").unwrap()
+                == "/spec/containers/1/readinessProbe/httpGet/port")
+        );
+    }
+
+    #[test]
+    fn aresta_sidecar_self_probes_mesh_probe_port() {
+        let cfg = InjectorConfig::default();
+        let sidecar = aresta_sidecar(&cfg);
+        // mesh-probe port present.
+        let ports = sidecar.pointer("/ports").unwrap().as_array().unwrap();
+        assert!(
+            ports.iter().any(|p| p.get("name").and_then(|v| v.as_str()) == Some("mesh-probe")
+                && p.get("containerPort").and_then(|v| v.as_u64()) == Some(4191))
+        );
+        // Sidecar's own probes point at mesh-probe.
+        let liv = sidecar.pointer("/livenessProbe/httpGet/port").unwrap();
+        assert_eq!(liv, "mesh-probe");
+        let liv_path = sidecar.pointer("/livenessProbe/httpGet/path").unwrap();
+        assert_eq!(liv_path, "/live");
+        let ready = sidecar.pointer("/readinessProbe/httpGet/port").unwrap();
+        assert_eq!(ready, "mesh-probe");
+        let ready_path = sidecar.pointer("/readinessProbe/httpGet/path").unwrap();
+        assert_eq!(ready_path, "/ready");
+    }
+
+    #[test]
+    fn iptables_rules_skip_probe_port() {
+        let cfg = InjectorConfig::default();
+        let init = iptables_init_container(&cfg, None);
+        let args = init.pointer("/args/0").unwrap().as_str().unwrap();
+        // Probe port 4191 RETURNs (not REDIRECTed to mTLS).
+        assert!(
+            args.contains("ARESTA_INBOUND -p tcp --dport 4191 -j RETURN"),
+            "probe port 4191 must be excused from PREROUTING REDIRECT; got args:\n{args}"
         );
     }
 
