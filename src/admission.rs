@@ -9,6 +9,11 @@ pub const INJECT_LABEL: &str = "mesh.pleme.io/inject";
 /// Annotation set on injected pods so re-admission is a no-op.
 pub const INJECTED_ANNOTATION: &str = "mesh.pleme.io/injected";
 
+/// Optional per-pod annotation: override the default aresta-config
+/// ConfigMap name. When set, the injector mounts this CM at
+/// `/etc/aresta` instead of the operator-configured default.
+pub const ARESTA_CONFIG_CM_ANNOTATION: &str = "enxerto.mesh.pleme.io/aresta-config-cm";
+
 /// Operator-tunable knobs (hard-coded to defaults for M2.2; M4
 /// renderer makes these per-mesh).
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use crate::admission::{INJECTED_ANNOTATION, InjectorConfig};
+use crate::admission::{ARESTA_CONFIG_CM_ANNOTATION, INJECTED_ANNOTATION, InjectorConfig};
 
 /// Generate the JSON-Patch ops that graft mesh containers + volumes
 /// + the idempotency annotation onto a Pod spec. `pod` is the
@@ -36,13 +36,29 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
 
     // 2. Volumes — spiffe-csi + aresta-config (ConfigMap mount).
     //    Append to /spec/volumes (creating the array if absent).
+    //
+    //    Per-pod override: if the pod carries the
+    //    `enxerto.mesh.pleme.io/aresta-config-cm` annotation, the
+    //    injector mounts THAT ConfigMap instead of the operator-
+    //    configured default. Lets multi-Servico clusters give each
+    //    Servico its own aresta config (different peer allow-lists,
+    //    different policy defaults, etc.) without bouncing the
+    //    injector.
+    let aresta_cfg_cm_name = pod
+        .pointer(&format!(
+            "/metadata/annotations/{}",
+            escape_key(ARESTA_CONFIG_CM_ANNOTATION)
+        ))
+        .and_then(|v| v.as_str())
+        .map_or_else(|| cfg.aresta_config_cm.clone(), str::to_string);
+
     let spiffe_vol = json!({
         "name": "spiffe-csi",
         "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
     });
     let aresta_cfg_vol = json!({
         "name": "aresta-config",
-        "configMap": { "name": cfg.aresta_config_cm }
+        "configMap": { "name": aresta_cfg_cm_name }
     });
     if pod.pointer("/spec/volumes").is_none() {
         ops.push(json!({
@@ -249,5 +265,32 @@ mod tests {
     fn json_pointer_escapes_slashes() {
         assert_eq!(escape_key("mesh.pleme.io/injected"), "mesh.pleme.io~1injected");
         assert_eq!(escape_key("a~b"), "a~0b");
+    }
+
+    #[test]
+    fn aresta_config_cm_annotation_overrides_default() {
+        let pod = json!({
+            "metadata": {
+                "name": "x",
+                "annotations": {
+                    "enxerto.mesh.pleme.io/aresta-config-cm": "per-pod-config"
+                }
+            },
+            "spec": { "containers": [{"name":"main"}] }
+        });
+        let ops = build_patch(&pod, &InjectorConfig::default());
+        // ops[1] is the volumes-full-array add (annotation mut means
+        // /spec/volumes is absent). Find the aresta-config volume
+        // inside that array and check its CM name.
+        let vols = ops[1].get("value").unwrap().as_array().unwrap();
+        let aresta_cfg = vols
+            .iter()
+            .find(|v| v.get("name").unwrap() == "aresta-config")
+            .expect("aresta-config volume present");
+        assert_eq!(
+            aresta_cfg.pointer("/configMap/name").unwrap().as_str().unwrap(),
+            "per-pod-config",
+            "annotation must override the default"
+        );
     }
 }
