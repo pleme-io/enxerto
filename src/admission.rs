@@ -68,7 +68,7 @@ fn default_aresta_image() -> String {
     // Pinned SHA — kubelet's IfNotPresent caches by tag, so
     // amd64-latest stays stale across rebuilds. Bump this when
     // shipping a new aresta build.
-    "ghcr.io/pleme-io/aresta:amd64-9037259".into()
+    "ghcr.io/pleme-io/aresta:amd64-dd75bbe".into()
 }
 fn default_iptables_image() -> String {
     // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
