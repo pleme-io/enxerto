@@ -128,25 +128,40 @@ fn iptables_init_container(cfg: &InjectorConfig) -> Value {
         },
         "command": ["/bin/sh", "-c"],
         "args": [format!(
-            // Redirect inbound TCP to 15001 (aresta inbound) UNLESS:
-            //  - destined for the proxy's own metrics/health ports
-            //  - destined for the iptables-skip ports (22 ssh, 53 dns)
-            //  - destined for loopback (127.0.0.0/8) — pod-internal IPC
+            // INBOUND: redirect inbound TCP to aresta-in (15001)
+            // unless: ssh/dns/metrics/aresta-self ports, or loopback.
             //
-            // We skip 9090 (aresta prometheus) so kubelet probes hit
-            // plaintext HTTP, not the mTLS-only inbound listener.
+            // OUTBOUND: redirect outbound TCP to aresta-out (15006)
+            // unless: traffic from aresta's own UID (1737) — aresta's
+            // own dial-out to peers must NOT loop, traffic to
+            // loopback / kube-apiserver / DNS, or already destined
+            // for aresta-out (15006) / aresta-in (15001).
             "iptables -t nat -N ARESTA_INBOUND 2>/dev/null || true; \
              iptables -t nat -F ARESTA_INBOUND; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 22 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 9090 -j RETURN; \
-             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {} -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {inbound} -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {outbound} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -d 127.0.0.0/8 -j RETURN; \
-             iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {}; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {inbound}; \
              iptables -t nat -C PREROUTING -p tcp -j ARESTA_INBOUND 2>/dev/null || \
                iptables -t nat -A PREROUTING -p tcp -j ARESTA_INBOUND; \
-             echo 'enxerto: iptables PREROUTING redirect to {} installed'",
-            cfg.inbound_port, cfg.inbound_port, cfg.inbound_port
+             iptables -t nat -N ARESTA_OUTBOUND 2>/dev/null || true; \
+             iptables -t nat -F ARESTA_OUTBOUND; \
+             iptables -t nat -A ARESTA_OUTBOUND -m owner --uid-owner {aresta_uid} -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -d 127.0.0.0/8 -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport 53 -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p udp --dport 53 -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {inbound} -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {outbound} -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port {outbound}; \
+             iptables -t nat -C OUTPUT -p tcp -j ARESTA_OUTBOUND 2>/dev/null || \
+               iptables -t nat -A OUTPUT -p tcp -j ARESTA_OUTBOUND; \
+             echo 'enxerto: iptables installed PREROUTING→{inbound}, OUTPUT→{outbound} (skip uid {aresta_uid})'",
+            inbound = cfg.inbound_port,
+            outbound = 15006,
+            aresta_uid = 1737,
         )]
     })
 }
@@ -157,8 +172,17 @@ fn aresta_sidecar(cfg: &InjectorConfig) -> Value {
         "image": cfg.aresta_image,
         "imagePullPolicy": "IfNotPresent",
         "args": ["--config", "/etc/aresta/config.yaml"],
+        // Run as UID 1737 — the iptables OUTPUT chain installed by
+        // the init-container has `--uid-owner 1737 -j RETURN`
+        // BEFORE the REDIRECT, so aresta's own dial-out to peers
+        // doesn't loop back through itself.
+        "securityContext": {
+            "runAsUser": 1737,
+            "runAsNonRoot": true
+        },
         "ports": [
             { "name": "mesh-inbound", "containerPort": cfg.inbound_port, "protocol": "TCP" },
+            { "name": "mesh-outbound", "containerPort": 15006, "protocol": "TCP" },
             { "name": "mesh-metrics", "containerPort": 9090, "protocol": "TCP" }
         ],
         "volumeMounts": [
@@ -167,9 +191,6 @@ fn aresta_sidecar(cfg: &InjectorConfig) -> Value {
                 "mountPath": "/run/spiffe.io",
                 "readOnly": true
             },
-            // Config materialized via a separate ConfigMap that lives
-            // alongside the pod (M4 renderer emits it; for now the
-            // operator drops `aresta-config` ConfigMap by hand).
             {
                 "name": "aresta-config",
                 "mountPath": "/etc/aresta",
