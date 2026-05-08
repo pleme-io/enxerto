@@ -34,6 +34,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 doesn't auto-pick a crypto provider; explicit install
+    // before any TLS config is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install ring as the rustls default crypto provider");
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
