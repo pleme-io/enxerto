@@ -149,6 +149,29 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
             )
         })
         .collect();
+
+    // Outbound REDIRECT shape:
+    //  - empty mesh_outbound_cidrs (back-compat): one catch-all
+    //    REDIRECT for all TCP not already RETURNed.
+    //  - non-empty: per-CIDR REDIRECTs only; non-mesh egress
+    //    (cloudflared → CF edge, workloads → public APIs) falls
+    //    through and is passed unchanged.
+    let outbound_redirect_lines: String = if cfg.mesh_outbound_cidrs.is_empty() {
+        format!(
+            "iptables -t nat -A ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port {outbound}; ",
+            outbound = 15006
+        )
+    } else {
+        cfg.mesh_outbound_cidrs
+            .iter()
+            .map(|cidr| {
+                format!(
+                    "iptables -t nat -A ARESTA_OUTBOUND -p tcp -d {cidr} -j REDIRECT --to-port {outbound}; ",
+                    outbound = 15006
+                )
+            })
+            .collect()
+    };
     json!({
         "name": "enxerto-iptables-init",
         "image": cfg.iptables_image,
@@ -175,7 +198,7 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport 9090 -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -p tcp --dport {inbound} -j RETURN; \
-             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {outbound} -j RETURN; \
+             iptables -t nat -A ARESTA_INBOUND -p tcp --dport {outbound_port} -j RETURN; \
              iptables -t nat -A ARESTA_INBOUND -d 127.0.0.0/8 -j RETURN; \
              iptables -t nat -N ARESTA_OUTBOUND 2>/dev/null || true; \
              iptables -t nat -F ARESTA_OUTBOUND; \
@@ -184,19 +207,20 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p udp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {inbound} -j RETURN; \
-             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {outbound} -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {outbound_port} -j RETURN; \
              {extra_skip}\
              iptables -t nat -A ARESTA_INBOUND -p tcp -j REDIRECT --to-port {inbound}; \
              iptables -t nat -C PREROUTING -p tcp -j ARESTA_INBOUND 2>/dev/null || \
                iptables -t nat -A PREROUTING -p tcp -j ARESTA_INBOUND; \
-             iptables -t nat -A ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port {outbound}; \
+             {outbound_redirect}\
              iptables -t nat -C OUTPUT -p tcp -j ARESTA_OUTBOUND 2>/dev/null || \
                iptables -t nat -A OUTPUT -p tcp -j ARESTA_OUTBOUND; \
-             echo 'enxerto: iptables installed PREROUTING→{inbound}, OUTPUT→{outbound} (skip uid {aresta_uid})'",
+             echo 'enxerto: iptables installed PREROUTING→{inbound}, OUTPUT→{outbound_port} (skip uid {aresta_uid})'",
             inbound = cfg.inbound_port,
-            outbound = 15006,
+            outbound_port = 15006,
             aresta_uid = 1737,
             extra_skip = extra_skip_lines,
+            outbound_redirect = outbound_redirect_lines,
         )]
     })
 }
@@ -318,6 +342,46 @@ mod tests {
         assert!(
             caps.iter()
                 .any(|v| v.as_str() == Some("NET_ADMIN"))
+        );
+    }
+
+    #[test]
+    fn empty_mesh_cidrs_yields_catch_all_outbound_redirect() {
+        let cfg = InjectorConfig::default();
+        let init = iptables_init_container(&cfg, None);
+        let args = init.pointer("/args/0").unwrap().as_str().unwrap();
+        // Catch-all REDIRECT for ALL outbound TCP (back-compat).
+        assert!(
+            args.contains("ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port 15006"),
+            "back-compat: empty mesh_outbound_cidrs must REDIRECT all outbound TCP. got args:\n{args}"
+        );
+        // Must NOT contain a per-CIDR REDIRECT.
+        assert!(
+            !args.contains("-d 10.42.0.0/16 -j REDIRECT"),
+            "must NOT use per-CIDR REDIRECT when mesh_outbound_cidrs is empty"
+        );
+    }
+
+    #[test]
+    fn mesh_cidrs_emit_per_cidr_redirect_only() {
+        let mut cfg = InjectorConfig::default();
+        cfg.mesh_outbound_cidrs = vec!["10.42.0.0/16".into(), "10.43.0.0/16".into()];
+        let init = iptables_init_container(&cfg, None);
+        let args = init.pointer("/args/0").unwrap().as_str().unwrap();
+        // Per-CIDR REDIRECT for both ranges.
+        assert!(
+            args.contains("ARESTA_OUTBOUND -p tcp -d 10.42.0.0/16 -j REDIRECT --to-port 15006"),
+            "must emit per-CIDR REDIRECT for 10.42.0.0/16. got args:\n{args}"
+        );
+        assert!(
+            args.contains("ARESTA_OUTBOUND -p tcp -d 10.43.0.0/16 -j REDIRECT --to-port 15006"),
+            "must emit per-CIDR REDIRECT for 10.43.0.0/16. got args:\n{args}"
+        );
+        // The catch-all `-p tcp -j REDIRECT` (no -d) must NOT appear,
+        // otherwise non-mesh egress (cloudflared → CF edge) loops.
+        assert!(
+            !args.contains("ARESTA_OUTBOUND -p tcp -j REDIRECT --to-port 15006"),
+            "must NOT emit catch-all REDIRECT when mesh_outbound_cidrs set. got args:\n{args}"
         );
     }
 

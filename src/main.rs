@@ -53,7 +53,27 @@ async fn main() -> Result<()> {
 
     info!(version = env!("CARGO_PKG_VERSION"), listen = %args.listen, "enxerto starting");
 
-    let cfg = Arc::new(InjectorConfig::default());
+    let mut injector_cfg = InjectorConfig::default();
+    // Optional env-driven knob: comma-separated CIDRs to restrict the
+    // outbound REDIRECT to (typically pod CIDR + service CIDR). When
+    // unset, the OUTPUT chain redirects ALL outbound TCP — fine for
+    // pure east-west test pods but breaks pods that egress to
+    // off-cluster destinations (cloudflared → CF edge, workloads →
+    // public APIs). Operator passes this through the helm chart's
+    // `meshOutboundCidrs` value.
+    if let Ok(raw) = std::env::var("MESH_OUTBOUND_CIDRS") {
+        injector_cfg.mesh_outbound_cidrs = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        info!(
+            cidrs = ?injector_cfg.mesh_outbound_cidrs,
+            "outbound mesh restricted to listed CIDRs (non-mesh egress passes through)"
+        );
+    }
+    let cfg = Arc::new(injector_cfg);
 
     let app = Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))

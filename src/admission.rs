@@ -54,6 +54,16 @@ pub struct InjectorConfig {
     /// pod-level config already covers it).
     #[serde(default = "default_image_pull_secrets")]
     pub image_pull_secrets: Vec<String>,
+
+    /// CIDRs whose outbound traffic should be transparently mTLS'd
+    /// via aresta. Empty (default, backwards-compat) → REDIRECT all
+    /// outbound TCP. Non-empty → only those CIDRs get REDIRECTed;
+    /// everything else passes through unchanged. Set to the pod +
+    /// service CIDR of the cluster to restrict the mesh to in-cluster
+    /// east-west traffic and let egress (cloudflared → CF edge,
+    /// workloads → public APIs, etc.) bypass.
+    #[serde(default)]
+    pub mesh_outbound_cidrs: Vec<String>,
 }
 
 impl Default for InjectorConfig {
@@ -66,6 +76,7 @@ impl Default for InjectorConfig {
             upstream_port: default_upstream_port(),
             aresta_config_cm: default_aresta_config_cm(),
             image_pull_secrets: default_image_pull_secrets(),
+            mesh_outbound_cidrs: Vec::new(),
         }
     }
 }
