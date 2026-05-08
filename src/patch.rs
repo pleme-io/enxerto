@@ -269,6 +269,8 @@ fn iptables_init_container(cfg: &InjectorConfig, skip_inbound_ports: Option<&str
              iptables -t nat -A ARESTA_OUTBOUND -d 127.0.0.0/8 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport 53 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p udp --dport 53 -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport 443 -j RETURN; \
+             iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport 6443 -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {inbound} -j RETURN; \
              iptables -t nat -A ARESTA_OUTBOUND -p tcp --dport {outbound_port} -j RETURN; \
              {extra_skip}\
