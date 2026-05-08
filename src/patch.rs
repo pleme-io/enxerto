@@ -34,16 +34,25 @@ pub fn build_patch(pod: &Value, cfg: &InjectorConfig) -> Vec<Value> {
         }));
     }
 
-    // 2. spiffe-csi volume → /spec/volumes (create the array if it
-    //    doesn't exist).
+    // 2. Volumes — spiffe-csi + aresta-config (ConfigMap mount).
+    //    Append to /spec/volumes (creating the array if absent).
     let spiffe_vol = json!({
         "name": "spiffe-csi",
         "csi": { "driver": cfg.spiffe_csi_driver, "readOnly": true }
     });
+    let aresta_cfg_vol = json!({
+        "name": "aresta-config",
+        "configMap": { "name": cfg.aresta_config_cm }
+    });
     if pod.pointer("/spec/volumes").is_none() {
-        ops.push(json!({ "op": "add", "path": "/spec/volumes", "value": [spiffe_vol] }));
+        ops.push(json!({
+            "op": "add",
+            "path": "/spec/volumes",
+            "value": [spiffe_vol, aresta_cfg_vol]
+        }));
     } else {
         ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": spiffe_vol }));
+        ops.push(json!({ "op": "add", "path": "/spec/volumes/-", "value": aresta_cfg_vol }));
     }
 
     // 3. iptables-redirect init-container → /spec/initContainers.
@@ -152,12 +161,14 @@ mod tests {
             }
         });
         let ops = build_patch(&pod, &InjectorConfig::default());
-        assert_eq!(ops.len(), 4);
+        // 1 annotation + 2 volumes (spiffe-csi + aresta-config) + 1 init + 1 container = 5
+        assert_eq!(ops.len(), 5);
         assert!(ops[0].get("path").unwrap().as_str().unwrap()
             .starts_with("/metadata/annotations/mesh.pleme.io"));
         assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes/-");
-        assert_eq!(ops[2].get("path").unwrap(), "/spec/initContainers/-");
-        assert_eq!(ops[3].get("path").unwrap(), "/spec/containers/-");
+        assert_eq!(ops[2].get("path").unwrap(), "/spec/volumes/-");
+        assert_eq!(ops[3].get("path").unwrap(), "/spec/initContainers/-");
+        assert_eq!(ops[4].get("path").unwrap(), "/spec/containers/-");
     }
 
     #[test]
@@ -165,15 +176,19 @@ mod tests {
         // Minimal pod — no annotations, no volumes, no initContainers.
         let pod = json!({"metadata": {"name": "x"}, "spec": {"containers": [{"name":"main"}]}});
         let ops = build_patch(&pod, &InjectorConfig::default());
+        // 1 annotation + 1 volumes-full-array + 1 init-full-array + 1 container = 4
         assert_eq!(ops.len(), 4);
 
         // Annotation: full-map add.
         assert_eq!(ops[0].get("path").unwrap(), "/metadata/annotations");
         assert!(ops[0].pointer("/value/mesh.pleme.io~1injected").is_some());
 
-        // Volumes: full-array add.
+        // Volumes: full-array add carrying both spiffe-csi + aresta-config.
         assert_eq!(ops[1].get("path").unwrap(), "/spec/volumes");
-        assert!(ops[1].get("value").unwrap().is_array());
+        let vols = ops[1].get("value").unwrap().as_array().unwrap();
+        assert_eq!(vols.len(), 2);
+        assert!(vols.iter().any(|v| v.get("name").unwrap() == "spiffe-csi"));
+        assert!(vols.iter().any(|v| v.get("name").unwrap() == "aresta-config"));
 
         // initContainers: full-array add.
         assert_eq!(ops[2].get("path").unwrap(), "/spec/initContainers");

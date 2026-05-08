@@ -29,6 +29,13 @@ pub struct InjectorConfig {
     /// listening port; today hardcoded — M4 makes it per-Servico).
     #[serde(default = "default_upstream_port")]
     pub upstream_port: u16,
+
+    /// Name of the ConfigMap with the aresta proxy's `config.yaml`.
+    /// Emitted by tatara-mesh-render as `<mesh-name>-aresta-config`;
+    /// today hardcoded to the openclaw demo's name. M4-renderer-side
+    /// can pass this in via a per-pod annotation in a follow-up.
+    #[serde(default = "default_aresta_config_cm")]
+    pub aresta_config_cm: String,
 }
 
 impl Default for InjectorConfig {
@@ -39,6 +46,7 @@ impl Default for InjectorConfig {
             spiffe_csi_driver: default_csi_driver(),
             inbound_port: default_inbound_port(),
             upstream_port: default_upstream_port(),
+            aresta_config_cm: default_aresta_config_cm(),
         }
     }
 }
@@ -59,6 +67,9 @@ fn default_inbound_port() -> u16 {
 }
 fn default_upstream_port() -> u16 {
     8080
+}
+fn default_aresta_config_cm() -> String {
+    "openclaw-mesh-aresta-config".into()
 }
 
 /// Decide whether to inject. Inputs:
