@@ -54,22 +54,24 @@ async fn main() -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), listen = %args.listen, "enxerto starting");
 
     let mut injector_cfg = InjectorConfig::default();
-    // Optional env-driven knob: comma-separated CIDRs to restrict the
-    // outbound REDIRECT to (typically pod CIDR + service CIDR). When
-    // unset, the OUTPUT chain redirects ALL outbound TCP — fine for
-    // pure east-west test pods but breaks pods that egress to
-    // off-cluster destinations (cloudflared → CF edge, workloads →
-    // public APIs). Operator passes this through the helm chart's
-    // `meshOutboundCidrs` value.
+
     // Operator-provided aresta image override — avoids rebuilding
-    // enxerto on every aresta version bump. CI workflow sets this
-    // env from the most-recently-published aresta tag.
+    // enxerto on every aresta version bump. The helm chart's
+    // `arestaImage` value lands here; CI workflows set it from the
+    // most-recently-published aresta tag.
     if let Ok(image) = std::env::var("ARESTA_IMAGE") {
         if !image.is_empty() {
             injector_cfg.aresta_image = image.clone();
             info!(image, "aresta image overridden from ARESTA_IMAGE env");
         }
     }
+
+    // Comma-separated CIDRs to restrict the outbound REDIRECT to
+    // (typically pod CIDR + service CIDR). When unset, the OUTPUT
+    // chain redirects ALL outbound TCP — fine for pure east-west test
+    // pods but breaks pods that egress to off-cluster destinations
+    // (cloudflared → CF edge, workloads → public APIs). The helm
+    // chart's `meshOutboundCidrs` value lands here.
     if let Ok(raw) = std::env::var("MESH_OUTBOUND_CIDRS") {
         injector_cfg.mesh_outbound_cidrs = raw
             .split(',')
@@ -147,12 +149,12 @@ async fn mutate(State(cfg): State<Arc<InjectorConfig>>, Json(body): Json<Value>)
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    // Apiserver passes nsLabels in /request/namespace as a *name*, not
-    // the full Namespace object. To be label-aware we'd need to read
-    // the Namespace via kube-rs at decision time. For M2.2, treat ns
-    // labels as empty unless the apiserver has been configured to
-    // fetch them via `objectSelector` matching. The pod label is the
-    // primary opt-in path.
+    // The apiserver only passes the namespace *name* in
+    // /request/namespace, not the full Namespace object. To be
+    // ns-label-aware we'd need a kube-rs lookup at decision time;
+    // for now the pod-level `mesh.pleme.io/inject` label is the
+    // primary opt-in path, and the namespaceSelector on the MWC
+    // (in lareira-enxerto's chart) excludes infra namespaces upfront.
     let ns_labels = serde_json::Map::new();
 
     if !decide(&pod_labels, &pod_annotations, &ns_labels) {

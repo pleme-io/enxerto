@@ -20,8 +20,11 @@ pub const ARESTA_CONFIG_CM_ANNOTATION: &str = "enxerto.mesh.pleme.io/aresta-conf
 /// aresta-in's mTLS-only listener. e.g. "8082,8083" for cartorio+lacre.
 pub const SKIP_INBOUND_PORTS_ANNOTATION: &str = "enxerto.mesh.pleme.io/skip-inbound-ports";
 
-/// Operator-tunable knobs (hard-coded to defaults for M2.2; M4
-/// renderer makes these per-mesh).
+/// Operator-tunable knobs. Values come from `InjectorConfig::default`
+/// + env-var overrides on the enxerto Deployment (`ARESTA_IMAGE`,
+/// `MESH_OUTBOUND_CIDRS`). Per-pod overrides for `aresta_config_cm`
+/// + skip-inbound ports flow through annotations on the pod itself
+/// (see `ARESTA_CONFIG_CM_ANNOTATION`, `SKIP_INBOUND_PORTS_ANNOTATION`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InjectorConfig {
     /// Container image for the aresta proxy.
@@ -36,15 +39,17 @@ pub struct InjectorConfig {
     /// Inbound port the proxy listens on.
     #[serde(default = "default_inbound_port")]
     pub inbound_port: u16,
-    /// Where the proxy forwards plaintext to (matches the workload's
-    /// listening port; today hardcoded — M4 makes it per-Servico).
+    /// Fallback target for aresta-in's plaintext forward — only
+    /// consulted when SO_ORIGINAL_DST recovery fails. Real workload
+    /// port is recovered transparently from the accepted socket.
     #[serde(default = "default_upstream_port")]
     pub upstream_port: u16,
 
-    /// Name of the ConfigMap with the aresta proxy's `config.yaml`.
-    /// Emitted by tatara-mesh-render as `<mesh-name>-aresta-config`;
-    /// today hardcoded to the openclaw demo's name. M4-renderer-side
-    /// can pass this in via a per-pod annotation in a follow-up.
+    /// Default ConfigMap name with the aresta proxy's `config.yaml`.
+    /// Each pod can override via the `ARESTA_CONFIG_CM_ANNOTATION`
+    /// annotation — required for cross-namespace participants
+    /// (cloudflared) whose CM lives in their own ns rather than the
+    /// home mesh ns.
     #[serde(default = "default_aresta_config_cm")]
     pub aresta_config_cm: String,
 
