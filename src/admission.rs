@@ -95,10 +95,18 @@ fn default_aresta_image() -> String {
 }
 fn default_iptables_image() -> String {
     // nicolaka/netshoot ships iptables, iproute2, curl, etc. — public
-    // image, widely vendored in service-mesh init containers. Future
-    // alternatives: linkerd/proxy-init or a minimal pleme-io-built
-    // iptables-only image.
-    "nicolaka/netshoot:latest".into()
+    // image, widely vendored in service-mesh init containers.
+    //
+    // **Plan goal #6 — digest-pinned, no `:latest`.** Pinned by sha256
+    // to nicolaka/netshoot:v0.13 (released 2024-05-15) so every cluster
+    // gets the exact same bytes the upstream maintainer cut a release
+    // for. Operator overrides via `IPTABLES_IMAGE` env var on the
+    // enxerto Deployment.
+    //
+    // Future cleanup: build a minimal pleme-io-attested iptables-only
+    // image so the iptables init bears a cartorio admission record
+    // like every other workload.
+    "nicolaka/netshoot:v0.13@sha256:a20c2531bf35436ed3766cd6cfe89d352b050ccc4d7005ce6400adf97503da1b".into()
 }
 fn default_csi_driver() -> String {
     "csi.spiffe.io".into()
